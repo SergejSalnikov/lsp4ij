@@ -13,24 +13,23 @@
  *******************************************************************************/
 package com.redhat.devtools.lsp4ij.features.documentLink;
 
-import com.intellij.codeInsight.daemon.impl.HighlightInfoType;
-import com.intellij.lang.annotation.AnnotationHolder;
-import com.intellij.lang.annotation.ExternalAnnotator;
-import com.intellij.openapi.editor.DefaultLanguageHighlighterColors;
+import com.intellij.codeInsight.navigation.actions.GotoDeclarationHandler;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.editor.Editor;
+import com.intellij.openapi.module.Module;
 import com.intellij.openapi.progress.ProcessCanceledException;
-import com.intellij.openapi.util.Key;
+import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.TextRange;
+import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiFile;
 import com.redhat.devtools.lsp4ij.LSPFileSupport;
 import com.redhat.devtools.lsp4ij.LSPIJUtils;
-import com.redhat.devtools.lsp4ij.client.ExecuteLSPFeatureStatus;
-import com.redhat.devtools.lsp4ij.client.indexing.ProjectIndexingManager;
-import com.redhat.devtools.lsp4ij.features.AbstractLSPExternalAnnotator;
+import com.redhat.devtools.lsp4ij.LanguageServersRegistry;
+import com.redhat.devtools.lsp4ij.client.features.FileUriSupport;
+import org.eclipse.lsp4j.DocumentLink;
 import org.eclipse.lsp4j.DocumentLinkParams;
 import org.eclipse.lsp4j.TextDocumentIdentifier;
-import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,36 +39,48 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
+import static com.redhat.devtools.lsp4ij.features.documentLink.LSPDocumentLinkPsiElement.isHttpUrl;
 import static com.redhat.devtools.lsp4ij.internal.CompletableFutures.isDoneNormally;
 import static com.redhat.devtools.lsp4ij.internal.CompletableFutures.waitUntilDone;
 
 /**
- * Intellij {@link ExternalAnnotator} implementation which collect LSP document links and display them with underline style.
+ * {@link GotoDeclarationHandler} implementation used to open LSP document link with CTrl+Click.
  */
-public class LSPDocumentLinkAnnotator extends AbstractLSPExternalAnnotator<List<DocumentLinkData>, List<DocumentLinkData>> {
+public class LSPDocumentLinkGotoDeclarationHandler implements GotoDeclarationHandler {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(LSPDocumentLinkAnnotator.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(LSPDocumentLinkGotoDeclarationHandler.class);
 
-    private static final Key<Boolean> APPLIED_KEY = Key.create("lsp.documentLink.annotator.applied");
-
-    public LSPDocumentLinkAnnotator() {
-        super(APPLIED_KEY);
-    }
-
-    @Nullable
     @Override
-    public List<DocumentLinkData> collectInformation(@NotNull PsiFile psiFile, @NotNull Editor editor, boolean hasErrors) {
-        if (ProjectIndexingManager.canExecuteLSPFeature(psiFile) != ExecuteLSPFeatureStatus.NOW) {
-            return null;
+    public PsiElement @Nullable [] getGotoDeclarationTargets(@Nullable PsiElement sourceElement, int offset, Editor editor) {
+        if (sourceElement == null) {
+            return PsiElement.EMPTY_ARRAY;
         }
-        // Consume LSP 'textDocument/documentLink' request
+        PsiFile psiFile = sourceElement.getContainingFile();
+        if (!LanguageServersRegistry.getInstance().isFileSupported(psiFile)) {
+            return PsiElement.EMPTY_ARRAY;
+        }
+        Project project = sourceElement.getProject();
+        Document document = editor.getDocument();
+
         LSPDocumentLinkSupport documentLinkSupport = LSPFileSupport.getSupport(psiFile).getDocumentLinkSupport();
-        var params = new DocumentLinkParams(new TextDocumentIdentifier());
-        documentLinkSupport.cancel();
-        CompletableFuture<List<DocumentLinkData>> documentLinkFuture = documentLinkSupport.getDocumentLinks(params);
+        CompletableFuture<List<DocumentLinkData>> documentLinkFuture = documentLinkSupport.getValidLSPFuture();
+
+        if (documentLinkFuture == null) {
+            VirtualFile file = LSPIJUtils.getFile(document);
+            Module module = LSPIJUtils.getModule(file, sourceElement.getProject());
+            // Query LS only for files inside the project.
+            if (module == null || module.isDisposed()) {
+                return PsiElement.EMPTY_ARRAY;
+            }
+
+            var params = new DocumentLinkParams(new TextDocumentIdentifier());
+            documentLinkFuture = documentLinkSupport.getDocumentLinks(params);
+        }
+
         try {
             waitUntilDone(documentLinkFuture, psiFile);
-        } catch (ProcessCanceledException e) {//Since 2024.2 ProcessCanceledException extends CancellationException so we can't use multicatch to keep backward compatibility
+        } catch (
+                ProcessCanceledException e) {//Since 2024.2 ProcessCanceledException extends CancellationException so we can't use multicatch to keep backward compatibility
             //TODO delete block when minimum required version is 2024.2
             documentLinkSupport.cancel();
             return null;
@@ -83,33 +94,35 @@ public class LSPDocumentLinkAnnotator extends AbstractLSPExternalAnnotator<List<
         }
 
         if (isDoneNormally(documentLinkFuture)) {
-            return documentLinkFuture.getNow(null);
-        }
-        return null;
-    }
-
-    @Override
-    public @Nullable List<DocumentLinkData> doAnnotate(List<DocumentLinkData> documentLinks) {
-        return documentLinks;
-    }
-
-    @Override
-    public void doApply(@NotNull PsiFile file, @Nullable List<DocumentLinkData> documentLinks, @NotNull AnnotationHolder holder) {
-        if (documentLinks == null || documentLinks.isEmpty()) {
-            return;
-        }
-        Document document = LSPIJUtils.getDocument(file.getVirtualFile());
-        if (document == null) {
-            return;
-        }
-        for (var documentLink : documentLinks) {
-            TextRange range = LSPIJUtils.toTextRange(documentLink.documentLink().getRange(), document);
-            if (range != null) {
-                holder.newSilentAnnotation(HighlightInfoType.HIGHLIGHTED_REFERENCE_SEVERITY)
-                        .range(range)
-                        .textAttributes(DefaultLanguageHighlighterColors.HIGHLIGHTED_REFERENCE)
-                        .create();
+            List<DocumentLinkData> documentLinks = documentLinkFuture.getNow(null);
+            if (documentLinks != null) {
+                for (DocumentLinkData documentLinkData : documentLinks) {
+                    DocumentLink documentLink = documentLinkData.documentLink();
+                    TextRange range = LSPIJUtils.toTextRange(documentLink.getRange(), document);
+                    if (range != null && range.contains(offset)) {
+                        // The Ctrl+Click has been done in a LSP document link,try to open the document.
+                        final String target = documentLink.getTarget();
+                        if (target != null && !target.isEmpty()) {
+                            String tooltip = documentLink.getTooltip();
+                            FileUriSupport fileUriSupport = documentLinkData.languageServer().getClientFeatures();
+                            if (isHttpUrl(target)) {
+                                // the target is a Http url which must be opened in the browser
+                                return new PsiElement[]{new LSPDocumentLinkPsiElement(target, tooltip, fileUriSupport, project)};
+                            }
+                            VirtualFile targetFile = FileUriSupport.findFileByUri(target, fileUriSupport);
+                            if (targetFile == null) {
+                                // The LSP document link file doesn't exist, open a file dialog
+                                // which asks if user want to create the file.
+                                return new PsiElement[]{new LSPDocumentLinkPsiElement(target, tooltip, fileUriSupport, project)};
+                            }
+                            // The file exists, open it in an editor
+                            return new PsiElement[]{LSPIJUtils.getPsiFile(targetFile, project)};
+                        }
+                    }
+                }
             }
         }
+        return PsiElement.EMPTY_ARRAY;
     }
+
 }
