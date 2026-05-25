@@ -99,8 +99,6 @@ public class LanguageServerWrapper implements Disposable {
     protected final Map<URI /* file Uri */, OpenedDocument> openedDocuments;
     @NotNull
     protected final Map<URI /* file Uri */, ClosedDocument> closedDocuments;
-    // Lock object to prevent deadlock when accessing both openedDocuments and closedDocuments
-    private final Object documentsLock = new Object();
     @Nullable
     protected final URI initialPath;
     protected final InitializeParams initParams = new InitializeParams();
@@ -117,7 +115,7 @@ public class LanguageServerWrapper implements Disposable {
     private final LSPFileListener fileListener;
     private final AtomicInteger keepAliveCounter = new AtomicInteger();
     protected StreamConnectionProvider lspStreamProvider;
-    private volatile MessageBusConnection messageBusConnection;
+    private MessageBusConnection messageBusConnection;
     private Future<?> launcherFuture;
     private int numberOfRestartAttempts;
     private @Nullable CompletableFuture<Void> initializeFuture;
@@ -140,7 +138,7 @@ public class LanguageServerWrapper implements Disposable {
     private @Nullable TracingMessageConsumer tracing;
     private volatile @Nullable ConcurrentLinkedQueue<LSPTrace> traces;
     private @Nullable Alarm traceFlushAlarm;
-    private volatile @Nullable InitializingContext currentInitializingContext;
+    private InitializingContext currentInitializingContext;
     private @NotNull TextDocumentSyncOptions syncOptions;
 
     /* Backwards compatible constructor */
@@ -323,33 +321,6 @@ public class LanguageServerWrapper implements Disposable {
      * @throws LanguageServerException thrown when the language server cannot be started
      */
     public synchronized void start() throws LanguageServerException {
-        // Check for errors in LSP messages
-        // launcherFuture manages request/reponse LSP messages from the server
-        if (serverError == null) {
-            // If the launcher is done, check if there was an error
-            if (launcherFuture != null && launcherFuture.isDone()) {
-                // There is an error with messages. Ex: invalid int id)
-                // {
-                //  "id" : 1779401475267,
-                //  "jsonrpc" : "2.0",
-                //  "method" : "client/registerCapability",
-                //  "params" : {
-                try {
-                    // Try to get the result with a short timeout
-                    launcherFuture.get(5, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    // Interrupted - no action needed
-                } catch (ExecutionException e) {
-                    // An error occurred in LSP message processing
-                    serverError = new LanguageServerException(e.getCause());
-                } catch (TimeoutException e) {
-                    // Timeout - no error detected
-                }
-                // Show error notification if serverError was set
-                // The server will be stopped automatically after several attempts
-                showNotificationStartServerError();
-            }
-        }
         if (serverError != null) {
             // Here the language server has been not possible
             // we stop it and attempts a new restart if needed
@@ -377,7 +348,7 @@ public class LanguageServerWrapper implements Disposable {
         if (this.initializeFuture == null) {
             final VirtualFile rootURI = getRootURI();
             this.launcherFuture = new CompletableFuture<>();
-            @NotNull var context = this.currentInitializingContext = new InitializingContext();
+            var context = this.currentInitializingContext = new InitializingContext();
             // Use IntelliJ pooled thread instead of ForkJoinPool.commonPool() to avoid
             // ForkJoinPool.helpAsyncBlocker() executing blocking operations (like OSProcessHandler.waitFor())
             // in the current thread when called from ReadAction.
@@ -428,7 +399,7 @@ public class LanguageServerWrapper implements Disposable {
                         // Throws the CannotStartProcessException exception if process is not alive.
                         // This use case comes for instance when the start process command fails (not a valid start command)
                         provider.ensureIsAlive();
-                        startFuture.complete(context);
+                        startFuture.complete(currentInitializingContext);
                 } catch (Exception e) {
                     startFuture.completeExceptionally(e);
                 }
@@ -633,10 +604,10 @@ public class LanguageServerWrapper implements Disposable {
     }
 
     private void startStopTimer() {
-        updateStatus(ServerStatus.stopping);
         int delayMs = (int) TimeUnit.SECONDS.toMillis(serverDefinition.getLastDocumentDisconnectedTimeout());
         getStopAlarm().addRequest(() -> {
             try {
+                updateStatus(ServerStatus.stopping);
                 stop();
             } catch (Throwable t) {
                 LOGGER.error("Failed to stop language server {}", serverDefinition.getId(), t);
@@ -742,12 +713,13 @@ public class LanguageServerWrapper implements Disposable {
                 folderToNotify = workspaceFolderNotificationManager.computeWorkspaceFolderToNotify(file);
             }
 
+            synchronized (closedDocuments) {
+                closedDocuments.remove(fileUri);
+            }
+
             CompletableFuture<LanguageServer> result;
             boolean shouldNotify = false;
-            synchronized (documentsLock) {
-                // Remove from closed documents and check if already opened
-                closedDocuments.remove(fileUri);
-
+            synchronized (openedDocuments) {
                 // Check again if file is already opened (within synchronized block)
                 ls2 = getLanguageServerWhenDidOpen(fileUri, waitForDidOpen);
                 if (ls2 != null) {
@@ -977,7 +949,7 @@ public class LanguageServerWrapper implements Disposable {
     public @Nullable ClosedDocument getClosedDocument(URI fileUri, boolean force) {
         var closedDocument = closedDocuments.get(fileUri);
         if (closedDocument == null && force) {
-            synchronized (documentsLock) {
+            synchronized (closedDocuments) {
                 closedDocument = closedDocuments.get(fileUri);
                 if (closedDocument == null) {
                     closedDocument = new ClosedDocument();
@@ -1673,7 +1645,7 @@ public class LanguageServerWrapper implements Disposable {
                 // stopping the new process created with a new start.
                 return CompletableFuture.runAsync(() -> {
                     shutdownAll(languageServer, lspStreamProvider, launcherFuture);
-                    boolean delayedCurrent = currentInitializingContext == null || currentInitializingContext.equals(initializingContext);
+                    boolean delayedCurrent = currentInitializingContext == null || initializingContext.equals(currentInitializingContext);
                     if (delayedCurrent) {
                         updateStatus(ServerStatus.stopped);
                     }
@@ -1696,7 +1668,6 @@ public class LanguageServerWrapper implements Disposable {
 
                 if (messageBusConnection != null) {
                     messageBusConnection.disconnect();
-                    messageBusConnection = null;
                 }
             }
         }
